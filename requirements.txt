@@ -1,0 +1,5 @@
+aiohttp>=3.11.18,<4
+aiosqlite>=0.21,<1
+beautifulsoup4>=4.13,<5
+readability-lxml>=0.8.1,<0.9
+certifi>=2025.4.26

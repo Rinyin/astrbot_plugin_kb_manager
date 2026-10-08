@@ -1,0 +1,38 @@
+{
+  "default_embedding_provider_id": {
+    "description": "默认嵌入模型提供商 ID",
+    "type": "string",
+    "hint": "填写嵌入模型（embedding）提供商 ID，可用 kbm_list_kbs 返回的候选列表获取；也可留空，由 LLM 在创建知识库时选择（恰好只有一个可用嵌入模型时自动选择，多个候选时由工具返回候选供 LLM 选择）。此处不是聊天模型，聊天模型不会被当作嵌入模型。",
+    "default": ""
+  },
+  "max_file_mb": {
+    "description": "单个文件/附件大小上限（MiB）",
+    "type": "int",
+    "hint": "必须为正整数。导入的文本文件或会话附件超过该值时拒绝导入。",
+    "default": 20
+  },
+  "max_url_mb": {
+    "description": "单个网页正文大小上限（MiB）",
+    "type": "int",
+    "hint": "必须为正整数。抓取公网网页时的下载与提取正文上限均受此约束。",
+    "default": 5
+  },
+  "attachment_ttl_minutes": {
+    "description": "会话附件在内存中的有效期（分钟）",
+    "type": "int",
+    "hint": "必须为正整数。附件仅记录在当前管理员会话的本次运行内，超时后需重新发送；插件重载后记录清空。",
+    "default": 30
+  },
+  "http_timeout_seconds": {
+    "description": "网页抓取总超时（秒）",
+    "type": "int",
+    "hint": "必须为正整数。包含重定向在内的单次网页请求总时长上限。",
+    "default": 30
+  },
+  "max_concurrent_jobs": {
+    "description": "后台写任务的最大并发数",
+    "type": "int",
+    "hint": "必须为正整数。写入/导入等任务超过等待时间会返回 job_id，可稍后用状态工具查询。",
+    "default": 3
+  }
+}
