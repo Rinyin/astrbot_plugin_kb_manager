@@ -1,11 +1,14 @@
 """AstrBot plugin entry point wiring the KB manager tools to the services.
 
-The plugin exposes admin-only LLM tools backed by :mod:`backend`,
-:mod:`sources` and :mod:`jobs`. Every write goes through the job manager for
-idempotency, per-KB serialisation and durable results. Scope is always derived
-from the trusted event; it is never taken from model arguments.
+The plugin exposes LLM tools to every ordinary sender and backs them with
+:mod:`backend`, :mod:`sources` and :mod:`jobs`. Every write goes through the
+job manager for idempotency, per-KB serialisation and durable results; scope
+is always derived from the trusted event, never from model arguments. On
+every LLM request the entry point injects the autonomous-maintenance system
+prompt and this plugin's enabled tools, while honouring the session-level
+plugin switch and the global tool settings.
 
-See ``docs/dev/contract.md`` and ``docs/dev/report_c_main.md``.
+See ``docs/dev/contract.md`` and ``docs/dev/report_autonomy_implementation.md``.
 """
 
 from __future__ import annotations
@@ -22,8 +25,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
+from astrbot.core.agent.tool import ToolSet
+from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
 from . import common
+from .autonomy import inject_autonomy_prompt
 from .backend import NativeKBBackend
 from .jobs import JobManager
 from .sources import SourceManager
@@ -34,6 +40,11 @@ _WRITE_WAIT_SECONDS = common.DEFAULT_WAIT_SECONDS
 _TEXT_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".adoc"})
 _MAX_ATTACHMENT_HINTS = 10
 _MEBIBYTE = 1024 * 1024
+
+# Refusal codes for the per-session and per-tool gates. They are new codes;
+# the reserved table in ``common.py`` is never reused.
+_CODE_PLUGIN_DISABLED = "plugin_disabled"
+_CODE_TOOL_DISABLED = "tool_disabled"
 
 _CONFIG_DEFAULTS: dict[str, Any] = {
     "default_embedding_provider_id": "",
@@ -78,7 +89,7 @@ FetchFunc = Callable[[], Awaitable[Any]]
 
 
 class KBManagerPlugin(Star):
-    """Admin-only knowledge base management plugin."""
+    """Knowledge base manager with LLM-driven autonomous maintenance."""
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context, config)
@@ -94,8 +105,10 @@ class KBManagerPlugin(Star):
         embedding_provider_id = self._string_config(
             "default_embedding_provider_id"
         ).strip()
+        autonomy_system_prompt = self._string_config("autonomy_system_prompt")
 
         self._max_file_bytes = max_file_bytes
+        self._autonomy_system_prompt = autonomy_system_prompt
         self._backend = NativeKBBackend(context, embedding_provider_id)
         self._sources = SourceManager(
             data_dir,
@@ -194,7 +207,13 @@ class KBManagerPlugin(Star):
 
     @staticmethod
     def _tool_handler_module(tool: Any) -> str | None:
-        """Resolve a tool handler's module, unwrapping ``functools.partial``."""
+        """Resolve a tool owner's module, unwrapping wrappers and partials.
+
+        ``functools.partial`` handlers are unwrapped, and when a permission
+        wrapper hides both the handler and ``handler_module_path`` (the module
+        path is only attached on plugin activation), the wrapper's underlying
+        tool is consulted instead.
+        """
 
         handler = getattr(tool, "handler", None)
         if isinstance(handler, functools.partial):
@@ -205,6 +224,9 @@ class KBManagerPlugin(Star):
         path = getattr(tool, "handler_module_path", None)
         if isinstance(path, str) and path:
             return path
+        wrapped = getattr(tool, "_wrapped", None)
+        if wrapped is not None:
+            return KBManagerPlugin._tool_handler_module(wrapped)
         return None
 
     # ------------------------------------------------------------------
@@ -260,15 +282,73 @@ class KBManagerPlugin(Star):
             str(event.get_sender_id()),
         )
 
-    def _denied(self) -> str:
-        return common.json_dumps(
-            common.error_result(
-                common.KBError(
-                    "permission_denied",
-                    "administrator permission is required",
-                )
+    @staticmethod
+    def _refusal(code: str, message: str) -> str:
+        """Build a refusal envelope for a session or tool-state gate."""
+
+        return common.json_dumps(common.error_result(common.KBError(code, message)))
+
+    async def _session_enabled(self, event: AstrMessageEvent) -> bool:
+        """Return whether this plugin may act for the event's session.
+
+        The framework does not apply the session-level plugin switch to LLM
+        request hooks, so it is honoured explicitly here; the event's plugin
+        whitelist (``plugins_name``) wins when it excludes this plugin. A
+        failed lookup is logged and treated as disabled, never silently
+        allowed.
+
+        Args:
+            event: Incoming message event.
+
+        Returns:
+            True when the plugin is enabled for the event's session.
+        """
+
+        plugins = getattr(event, "plugins_name", None)
+        if plugins is not None and plugins != ["*"] and PLUGIN_NAME not in plugins:
+            return False
+        try:
+            return await SessionPluginManager.is_plugin_enabled_for_session(
+                str(event.unified_msg_origin), PLUGIN_NAME
             )
-        )
+        except Exception:
+            self.logger.exception(
+                "failed to check the session plugin state; treating it as disabled"
+            )
+            return False
+
+    async def _guard(self, event: AstrMessageEvent, action: str) -> str | None:
+        """Return a refusal envelope when ``action`` must not run.
+
+        Every tool is available to ordinary senders, but only while this
+        plugin is enabled for the current session and the tool itself is
+        active in the global tool settings.
+
+        Args:
+            event: Incoming message event.
+            action: Tool name being invoked.
+
+        Returns:
+            A JSON refusal envelope, or ``None`` when the tool may run.
+        """
+
+        if not await self._session_enabled(event):
+            return self._refusal(
+                _CODE_PLUGIN_DISABLED,
+                "this plugin is disabled for the current session",
+            )
+        try:
+            manager = self.context.get_llm_tool_manager()
+        except Exception:
+            self.logger.exception("failed to access the llm tool manager")
+            manager = None
+        tool = self._find_own_tool(manager, action) if manager is not None else None
+        if tool is None or not bool(getattr(tool, "active", True)):
+            return self._refusal(
+                _CODE_TOOL_DISABLED,
+                "this tool is disabled in the tool settings",
+            )
+        return None
 
     async def _read(
         self,
@@ -278,8 +358,9 @@ class KBManagerPlugin(Star):
         *,
         wrap: bool = True,
     ) -> str:
-        if not event.is_admin():
-            return self._denied()
+        refusal = await self._guard(event, action)
+        if refusal is not None:
+            return refusal
         try:
             data = fetch()
             if inspect.isawaitable(data):
@@ -307,8 +388,9 @@ class KBManagerPlugin(Star):
         action: str,
         submit: SubmitFunc,
     ) -> str:
-        if not event.is_admin():
-            return self._denied()
+        refusal = await self._guard(event, action)
+        if refusal is not None:
+            return refusal
         try:
             scope = self._scope(event)
             result = await submit(scope)
@@ -993,15 +1075,16 @@ class KBManagerPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def kbm_on_message(self, event: AstrMessageEvent):
-        """Cache real File attachments for the sender (admin only).
+        """Cache real File attachments for the sender.
 
-        This listener never replies, stops the event or imports content; it
-        only records attachment handles so a later tool call can import them.
+        Runs for every sender whose session has this plugin enabled. This
+        listener never replies, stops the event or imports content; it only
+        records attachment handles so a later tool call can import them.
 
         Args:
             event: Incoming message event.
         """
-        if not event.is_admin():
+        if not await self._session_enabled(event):
             return
         files = [
             component
@@ -1017,20 +1100,88 @@ class KBManagerPlugin(Star):
         except Exception:
             self.logger.exception("failed to remember chat attachments")
 
-    @filter.on_llm_request()
-    async def kbm_on_llm_request(self, event: AstrMessageEvent, request: Any) -> None:
-        """Inject this request's known attachment ids and names (admin only).
+    def _own_active_tools(self) -> dict[str, Any]:
+        """Snapshot this plugin's enabled tools from the wrapped tool set.
 
-        The hint is added as a temporary content part so it never pollutes the
-        stored conversation history, and it is explicitly data, not an
-        instruction. Existing system prompts are left untouched.
+        ``get_full_tool_set`` returns fresh ``_PermissionGuardedTool`` copies,
+        so the request receives framework-guarded tools while the global
+        registry stays untouched. Own tools that are deactivated in the tool
+        settings are deliberately absent.
+
+        Returns:
+            Mapping of tool name to wrapped tool for enabled own tools.
+        """
+
+        try:
+            snapshot = self.context.get_llm_tool_manager().get_full_tool_set()
+        except Exception:
+            self.logger.exception("failed to snapshot the llm tool set")
+            return {}
+        tools: dict[str, Any] = {}
+        for tool in snapshot.tools:
+            if self._tool_handler_module(tool) != __name__:
+                continue
+            name = getattr(tool, "name", None)
+            if isinstance(name, str) and name and bool(getattr(tool, "active", True)):
+                tools[name] = tool
+        return tools
+
+    def _add_own_tools(self, request: Any) -> None:
+        """Put this plugin's enabled tools into a private copy of the request set.
+
+        Other tools are preserved, bare own tools are replaced by the wrapped
+        snapshot versions, duplicate names collapse through ``add_tool``, and
+        a same-name tool owned outside this plugin always wins. The request's
+        previous tool set is never mutated.
+
+        Args:
+            request: Provider request being assembled.
+        """
+
+        own = self._own_active_tools()
+        tools = ToolSet()
+        foreign_names: set[str] = set()
+        if request.func_tool is not None:
+            for tool in list(request.func_tool.tools):
+                if self._tool_handler_module(tool) == __name__:
+                    continue
+                name = getattr(tool, "name", None)
+                if isinstance(name, str):
+                    foreign_names.add(name)
+                tools.add_tool(tool)
+        for name, tool in own.items():
+            if name in foreign_names:
+                continue
+            tools.add_tool(tool)
+        request.func_tool = tools
+
+    def _remove_own_tools(self, request: Any) -> None:
+        """Drop this plugin's tools from the request, keeping every other tool.
+
+        Args:
+            request: Provider request being assembled.
+        """
+
+        if request.func_tool is None:
+            return
+        tools = ToolSet()
+        for tool in list(request.func_tool.tools):
+            if self._tool_handler_module(tool) == __name__:
+                continue
+            tools.add_tool(tool)
+        request.func_tool = tools
+
+    def _inject_attachment_hint(self, event: AstrMessageEvent, request: Any) -> None:
+        """Append temporary attachment identifiers to the request.
+
+        The hint is a temporary content part, so it never pollutes the stored
+        conversation history, and it is explicitly data, not an instruction.
 
         Args:
             event: Incoming message event.
             request: Provider request being assembled.
         """
-        if not event.is_admin():
-            return
+
         try:
             attachments = self._sources.list_attachments(self._scope(event))
         except Exception:
@@ -1061,3 +1212,30 @@ class KBManagerPlugin(Star):
             request.extra_user_content_parts.append(TextPart(text=hint).mark_as_temp())
         except Exception:
             self.logger.exception("failed to inject the attachment hint")
+
+    @filter.on_llm_request(priority=-100)
+    async def kbm_on_llm_request(self, event: AstrMessageEvent, request: Any) -> None:
+        """Inject autonomy rules, enabled tools and attachment hints.
+
+        Runs on every ordinary LLM request regardless of sender role; there is
+        no maintain command and no user approval step. The session-level
+        plugin switch and the event's plugin whitelist are honoured: when the
+        plugin is disabled, nothing is injected and this plugin's tools are
+        removed from this turn's tool set. Existing system content is kept,
+        ``inject_autonomy_prompt`` stays idempotent through its marker block,
+        and attachment hints remain temporary extra content parts.
+
+        Args:
+            event: Incoming message event.
+            request: Provider request being assembled.
+        """
+
+        if not await self._session_enabled(event):
+            self._remove_own_tools(request)
+            return
+        request.system_prompt = inject_autonomy_prompt(
+            request.system_prompt,
+            self._autonomy_system_prompt,
+        )
+        self._add_own_tools(request)
+        self._inject_attachment_hint(event, request)

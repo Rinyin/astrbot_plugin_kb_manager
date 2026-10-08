@@ -1,8 +1,9 @@
 # KB 管理插件 · 模块契约 v0.3
 
 - 目标运行时：AstrBot v4.28.2（基线提交 `3c7adafa1397e182d60b1016bf88759265113c8a`）。
-- 关联实现：`common.py`、`backend.py`、`sources.py`、`jobs.py`、`main.py`。
-- 本文件不保留“待定/建议”式开放项；已确定的裁决直接写在下文。
+- 对应插件版本：`0.2.0`（LLM 自主知识运维）。
+- 关联实现：`common.py`、`backend.py`、`sources.py`、`jobs.py`、`autonomy.py`、`main.py`。
+- 本文档只记录已确定的裁决，不留开放项；裁决直接写在下文。
 
 本契约固定各模块的签名、语义与数据形状。实现内部结构不受限，但任何跨模块可见的接口不得偏离本契约；偏离必须先修订本文件并同步 `common.py`。
 
@@ -16,6 +17,8 @@
 2. `backend.py` → `NativeKBBackend`：方法签名、语义与返回 dict 形状。
 3. `sources.py` → `SourceManager`：构造与方法签名、语义。
 4. `jobs.py` → `JobManager`：构造、`submit`/`get`/`close`、状态机、幂等、并发与持久化。
+5. `autonomy.py` → 自主维护 SYSTEM 提示：`DEFAULT_AUTONOMY_PROMPT`、`inject_autonomy_prompt`、标记块与幂等替换。
+6. `main.py` 入口层：工具暴露与返回、scope 生成、附件记录、SYSTEM 注入入口与自主运维触发边界（见 §6）。
 
 ### 0.2 实现约束
 
@@ -29,6 +32,10 @@
 - 任务记录持久化在插件数据目录的 **SQLite** 数据库；第一版 **不自动清除**幂等记录。
 - 写操作仅针对 **单库**；创建库共用创建锁，**不实现多库写锁协议**。
 - 打包元数据（`metadata.yaml`/`requirements.txt`/`_conf_schema.json`）属于插件必需交付。
+- **自主运维触发边界（v0.2.0，已定）**：SYSTEM 只在 **AstrBot 已产生的正常 LLM 请求**上注入；不为没有产生模型请求的消息（如未被唤醒的群消息）额外发起后台 LLM 判断。消息监听仅用于登记真实附件，不发起额外模型调用。
+- **配置项（v0.2.0，已定）**：`_conf_schema.json` 保留原 6 项及其默认值不变，仅新增唯一一项 `autonomy_system_prompt`（`type=text`，默认值即内置 `DEFAULT_AUTONOMY_PROMPT`）；缺失 / 空白 / 非字符串 → 使用内置默认。不引入基于用户身份的维护开关，工具**不再按管理员身份门禁**。
+- **运行器边界（v0.2.0，已定）**：本插件的本地工具仅由 AstrBot 内置 Agent（`local` runner）执行；Dify / Coze / DashScope / DeerFlow 等第三方 Agent 运行器不执行这些本地工具，因此不适用自主维护。聊天模型可以是远程 API，与运行器类型无关。
+- 可信 scope 隔离（UMO + sender_id）与索引一致性语义**不因自主触发而放松**；17 个工具签名与存储 API 保持不变。
 
 ---
 
@@ -36,10 +43,11 @@
 
 ```text
 astrbot_plugin_kb_manager/
-├── main.py       # 插件入口：命令 / LLM 工具与生命周期
+├── main.py       # 插件入口：命令 / LLM 工具、SYSTEM 注入与生命周期
 ├── backend.py    # NativeKBBackend
 ├── sources.py    # SourceManager
 ├── jobs.py       # JobManager
+├── autonomy.py   # 自主维护 SYSTEM 提示（纯函数，仅标准库）
 ├── common.py     # 公共原语（仅标准库）
 ├── metadata.yaml / requirements.txt / _conf_schema.json
 ├── README.md / LICENSE
@@ -344,11 +352,48 @@ async def get(scope, job_id) -> dict
 
 ## 6. 入口层约定
 
-- `scope = encode_scope(event.unified_msg_origin, str(event.get_sender_id()))`；**scope 绝不来自 LLM 参数**。
-- 收到消息时把消息链中的 `File` 段筛选后交给 `remember_attachments`；其他类型不进 SourceManager；只接受真实 File 段，不接受 LLM 提供的路径。
+### 6.1 触发边界与适用范围
+
+- **适用范围**：只处理 **AstrBot 已经产生的正常 LLM 请求**（正常对话中已组装并交给模型的请求），任何发送者的正常请求都适用。
+- **运行器边界**：本地工具仅由 AstrBot 内置 Agent（`local` runner）执行；第三方 Agent 运行器（Dify / Coze / DashScope / DeerFlow 等）不执行本插件工具，故其对话不产生自主维护。聊天模型可以是远程 API，与运行器类型无关。
+- **不做额外模型调用**：不为没有产生模型请求的消息（如未被唤醒的群消息）额外发起后台 LLM 判断。消息监听只用于登记真实附件（见 §6.4），不调用模型、不回复、不入库。
+- **自主判断**：模型在每轮正常对话中自行评估本轮内容是否包含值得长期保留的专业知识，不依赖用户命令或审批。
+- **检索去重**：写入前应先经 `kbm_search` / `kbm_list_documents` / `kbm_read_document` 检查既有内容，避免重复录入。
+- **相关库更新与建库**：优先更新相关度最高的既有知识库；有可靠证据时允许纠正 / 替换过时内容；确实没有相关库且内容值得保留时，才调用 `kbm_create_kb` 新建。
+- **无需显式维护指令**：用户明确提出的维护要求与模型自主判断走同一组工具。
+
+### 6.2 SYSTEM 注入（`autonomy.py`）
+
+模块为纯函数、仅标准库，不导入 AstrBot / 服务 / 配置对象：
+
+```python
+AUTONOMY_BLOCK_START = "<!-- kbm-autonomy:start -->"
+AUTONOMY_BLOCK_END = "<!-- kbm-autonomy:end -->"
+DEFAULT_AUTONOMY_PROMPT: str  # 内置默认规则正文
+
+def inject_autonomy_prompt(system_prompt: str | None, policy: str | None = None) -> str: ...
+```
+
+- **注入入口**：入口层在 `@filter.on_llm_request()` 中按每个正常 LLM 请求调用 `inject_autonomy_prompt(当前系统提示, 配置的 policy)`，把返回值写回该请求的系统提示。
+- **幂等**：规则正文恒定包裹在 `AUTONOMY_BLOCK_START` / `AUTONOMY_BLOCK_END` 唯一标记块中；重复注入只替换本插件的标记块，相同策略重复调用结果不变，策略变化时块外系统内容保持不变。
+- **策略解析**：`policy` 为非空字符串时使用其规范文本（统一换行、剥离信封标记）；否则回退 `DEFAULT_AUTONOMY_PROMPT`。`system_prompt` 为 `None` / 空白 / 非字符串时按空串处理。
+- **配置映射**：唯一配置键 `autonomy_system_prompt`（`type=text`）；其 `default` 即内置 `DEFAULT_AUTONOMY_PROMPT`，缺失 / 空白 / 非字符串 → 内置默认。不新增其他自主运维参数。
+- **内容不变量**：注入内容只固定维护职责与判断 / 去重 / 幂等 / 如实汇报规则，不包含具体领域事实。
+
+### 6.3 工具供给与启停边界
+
+- 本插件当前已启用的 17 个工具随正常 LLM 请求提供给模型（按名合并进本次请求，不删除、不覆盖其他工具）；人格无需手动勾选 kbm 工具。
+- 框架明确的**插件禁用 / 会话禁用 / 全局工具停用 / 工具权限**仍然生效；本插件不绕过、不修改这些全局设置。
+- 停用本插件即停止 SYSTEM 注入与工具供给；清空 `autonomy_system_prompt` 即恢复内置默认规则；用户可编辑该提示以调整判断标准与入库尺度。
+
+### 6.4 隔离、幂等与写任务语义
+
+- `scope = encode_scope(event.unified_msg_origin, str(event.get_sender_id()))`；**scope 绝不来自 LLM 参数**，附件与任务按该 scope 隔离。
+- 工具**不再按管理员身份门禁**，也不引入基于用户身份的维护开关；数据可见性边界是 scope 隔离，而非管理员权限。
+- 收到消息时把消息链中的 `File` 段筛选后交给 `remember_attachments`（对所有会话生效）；其他类型不进 SourceManager；只接受真实 File 段，不接受 LLM 提供的路径。
 - 写工具把 `request_id` 作为 **必填 LLM 参数**透传（模型重试复用同一值，入口不得随机改写）；`job_id` 仅用于状态查询，不作为新任务参数。
-- 所有工具 **仅管理员可用**；不提供绕过权限的配置。
-- 写命令默认 `wait_seconds=3`；超时返回 `queued`/`running` + `job_id`，由查询命令轮询 `get`。
+- 自主触发的写入同样走 `JobManager`：默认 `wait_seconds=3`；超时返回 `queued`/`running` + `job_id`，由 `kbm_job_status` 轮询 `get`。
+- 索引一致性不因自主触发而放松：沿用 §3.2/§5 的“先写新后删旧”“先删向量再删文本/FTS 与元数据”语义；`partial`/`interrupted` 不得表述为成功。
 - 入口负责把 `SourceManager.load_*` 的 `SourceDocument` 传给 `NativeKBBackend` 写方法。
 
 ---

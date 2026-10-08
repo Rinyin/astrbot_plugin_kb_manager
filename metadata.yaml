@@ -1,7 +1,7 @@
 name: astrbot_plugin_kb_manager
 display_name: 知识库自主运维
-desc: 支持管理员在会话中通过 LLM 原生增删改 AstrBot 知识库、导入文本/附件/网页并检索分块，附带任务进度查询。
-version: "0.1.0"
+desc: 在每轮正常对话中自主判断知识价值、检索去重并维护 AstrBot 原生知识库；SYSTEM 维护规则可配置，支持文本/附件/网页导入与后台任务进度查询。
+version: "0.2.0"
 author: Rinyi
 astrbot_version: ">=4.28.2,<5"
 repo: https://github.com/Rinyin/astrbot_plugin_kb_manager

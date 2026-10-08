@@ -45,6 +45,7 @@ _COPY_FILES = (
     "sources.py",
     "jobs.py",
     "common.py",
+    "autonomy.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
@@ -381,7 +382,16 @@ async def _run_impl():
     metadata = star_map[MODULE]
     plugin = metadata.star_cls
     _OPEN["plugin"] = plugin
-    step("plugin_loaded", plugin_name=metadata.name, cls=type(plugin).__name__)
+    if metadata.version != "0.2.0":
+        raise AssertionError(
+            f"plugin version {metadata.version!r} != '0.2.0' (autonomy release)"
+        )
+    step(
+        "plugin_loaded",
+        plugin_name=metadata.name,
+        cls=type(plugin).__name__,
+        version=metadata.version,
+    )
 
     from data.plugins.astrbot_plugin_kb_manager.common import (  # noqa: PLC0415
         SOURCE_URL,
@@ -691,48 +701,72 @@ async def _run_impl():
     assert envelope_ok(url_import), url_import
     step("url_imported_stub")
 
-    # --- non-admin denied and storage unchanged --------------------------
+    # --- ordinary senders may use the tools (no admin gate) --------------
     before_total = (await call("kbm_list_documents", admin, kb_id=kb_id))["data"]["total"]
-    dummy_values = {
-        "request_id": "req-denied",
-        "kb_id": kb_id,
-        "doc_id": new_doc,
-        "chunk_id": "denied-chunk",
-        "name": "denied",
-        "description": "denied",
-        "embedding_provider_id": "e2e-embedding",
-        "chunk_size": 64,
-        "chunk_overlap": 0,
-        "changes": {"description": "denied"},
-        "filename": "denied.txt",
-        "content": "denied",
-        "query": "denied",
-        "kb_ids": [kb_id],
-        "top_k": 3,
-        "offset": 0,
-        "limit": 20,
-        "search": "",
-        "attachment_id": attachments["e2e.docx"],
-        "url": "https://example.invalid/denied",
-        "job_id": "denied-job",
-    }
-    denied = []
-    for name in TOOL_NAMES:
-        allowed, required = tool_signature(tools[name])
-        bag = {key: dummy_values[key] for key in allowed}
-        assert required <= set(bag), f"{name}: dummy bag missing {sorted(required)}"
-        env = await call(name, non_admin, **bag)
-        if envelope_ok(env):
-            denied.append(name)
-        else:
-            assert env["error"] is not None, f"{name}: denial has no error"
-            assert env["error"]["code"] == "permission_denied", (
-                f"{name}: expected permission_denied, got {env}"
-            )
-    after_total = (await call("kbm_list_documents", admin, kb_id=kb_id))["data"]["total"]
-    assert not denied, f"non-admin tools succeeded: {denied}"
-    assert after_total == before_total, "non-admin call changed storage"
-    step("non_admin_denied")
+    user_list = await call("kbm_list_kbs", non_admin)
+    assert envelope_ok(user_list), user_list
+    user_search = await call("kbm_search", non_admin, query=MARKER, kb_ids=[kb_id])
+    assert envelope_ok(user_search), user_search
+    user_add = await call(
+        "kbm_add_text",
+        non_admin,
+        request_id="req-user-add",
+        kb_id=kb_id,
+        filename="user-note.txt",
+        content="NONADMINMARKER an ordinary sender can maintain the KB",
+    )
+    assert envelope_ok(user_add), user_add
+    user_doc = user_add["data"]["document"]["doc_id"]
+    user_docs = await call("kbm_list_documents", non_admin, kb_id=kb_id)
+    assert envelope_ok(user_docs), user_docs
+    assert user_docs["data"]["total"] == before_total + 1, user_docs
+    assert any(item["doc_id"] == user_doc for item in user_docs["data"]["documents"]), (
+        user_docs
+    )
+    after_total = user_docs["data"]["total"]
+    step("non_admin_allowed")
+
+    # --- UMO + sender isolation for jobs and attachments -----------------
+    other = FakeEvent("kbm:e2e:other", "user-3003", False)
+    cross_job = await call("kbm_job_status", other, job_id=user_add["job_id"])
+    assert cross_job["status"] != "succeeded", cross_job
+    assert cross_job["error"] is not None, cross_job
+    assert cross_job["error"]["code"] == "job_not_found", cross_job
+
+    non_admin.set_messages([File("e2e.docx", file=str(docx_path))])
+    other.set_messages([File("e2e.docx", file=str(docx_path))])
+    await message_handler.handler(non_admin)
+    other_atts = (await call("kbm_list_attachments", other))["data"]["attachments"]
+    user_atts = (await call("kbm_list_attachments", non_admin))["data"]["attachments"]
+    assert any(item["filename"] == "e2e.docx" for item in user_atts), user_atts
+    assert other_atts == [], other_atts
+    step("scope_isolation")
+
+    # --- framework per-tool permission wrapping --------------------------
+    # The proxy returned by get_full_tool_set must consult the framework
+    # permission for an ordinary caller; this is authoritative even though the
+    # tools are no longer gated wholesale on admin identity.
+    await sp.global_put("tool_permissions", {"_default": {"kbm_add_text": "admin"}})
+    wrapped_add = llm_tools.get_full_tool_set().get_tool("kbm_add_text")
+    assert wrapped_add is not None, "kbm_add_text missing from the wrapped tool set"
+    assert getattr(wrapped_add, "handler", None) is None, (
+        "get_full_tool_set must return the permission proxy, not a raw handler"
+    )
+    proxy_context = SimpleNamespace(context=SimpleNamespace(event=non_admin))
+    denied_text = await wrapped_add.call(
+        proxy_context,
+        request_id="req-perm-denied",
+        kb_id=kb_id,
+        filename="denied.txt",
+        content="PERMDENYMARKER must never be written",
+    )
+    assert isinstance(denied_text, str) and "Permission denied" in denied_text, (
+        denied_text
+    )
+    after_denied = (await call("kbm_list_documents", admin, kb_id=kb_id))["data"]["total"]
+    assert after_denied == after_total, "permission-denied call changed storage"
+    await sp.global_put("tool_permissions", {})
+    step("tool_permission_enforced")
 
     # --- reload ----------------------------------------------------------
     # Create genuinely idle HTTP sessions to prove reload closes them.
@@ -946,7 +980,9 @@ def test_native_plugin_load_and_end_to_end(tmp_path):
         "kb_updated",
         "attachments_imported",
         "url_imported_stub",
-        "non_admin_denied",
+        "non_admin_allowed",
+        "scope_isolation",
+        "tool_permission_enforced",
         "reloaded",
         "request_id_reused",
         "attachment_idempotent",

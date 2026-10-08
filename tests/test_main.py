@@ -35,14 +35,40 @@ os.environ.setdefault("ASTRBOT_ROOT", tempfile.mkdtemp(prefix="kb_main_root_"))
 
 import astrbot.api  # noqa: E402,F401
 from astrbot.core.agent.message import TextPart  # noqa: E402
-from astrbot.core.agent.tool import FunctionTool  # noqa: E402
+from astrbot.core.agent.tool import FunctionTool, ToolSet  # noqa: E402
 from astrbot.core.message.components import File, Image, Plain  # noqa: E402
 from astrbot.core.provider.entities import ProviderRequest  # noqa: E402
 from astrbot.core.provider.register import llm_tools  # noqa: E402
 from plugins.astrbot_plugin_kb_manager import common  # noqa: E402
+from plugins.astrbot_plugin_kb_manager import main as main_module  # noqa: E402
+from plugins.astrbot_plugin_kb_manager.autonomy import (  # noqa: E402
+    AUTONOMY_BLOCK_START,
+    DEFAULT_AUTONOMY_PROMPT,
+)
 from plugins.astrbot_plugin_kb_manager.main import KBManagerPlugin  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def enabled_session(monkeypatch):
+    """Default unit tests to a session where this plugin is enabled.
+
+    ``SessionPluginManager`` is mocked so tests never depend on shared
+    preferences; individual tests re-patch it to exercise the disabled or the
+    failing-lookup path.
+    """
+
+    async def _enabled(umo: str, plugin_name: str) -> bool:
+        assert plugin_name == "astrbot_plugin_kb_manager"
+        return True
+
+    monkeypatch.setattr(
+        main_module.SessionPluginManager,
+        "is_plugin_enabled_for_session",
+        _enabled,
+    )
+
 
 TOOL_NAMES = (
     "kbm_list_kbs",
@@ -263,11 +289,13 @@ class FakeEvent:
         umo: str = "test-platform:GroupMessage:7",
         sender: str = "10001",
         messages: list[Any] | None = None,
+        plugins_name: list[str] | None = None,
     ) -> None:
         self.unified_msg_origin = umo
         self._sender = sender
         self._admin = admin
         self._messages = list(messages or [])
+        self.plugins_name = plugins_name
         self.stopped = False
 
     def is_admin(self) -> bool:
@@ -563,29 +591,93 @@ async def test_scope_is_never_a_tool_parameter():
 
 
 # ---------------------------------------------------------------------------
-# Permission gate
+# Availability for ordinary senders and session/tool gating
 # ---------------------------------------------------------------------------
 
 
-async def test_non_admin_gets_permission_denied_without_service_calls():
+async def test_all_tools_are_available_to_ordinary_senders():
     backend = FakeBackend()
     sources = FakeSources()
     jobs = FakeJobs()
     plugin = make_plugin(backend=backend, sources=sources, jobs=jobs)
-    event = FakeEvent(admin=False)
+    event = FakeEvent(admin=False, umo="umo-user", sender="user-2002")
+
+    for name in TOOL_NAMES:
+        result = decode(await getattr(plugin, name)(event, **CALL_ARGS[name]))
+        assert result["status"] == "succeeded", (name, result)
+        assert result["error"] is None, (name, result)
+
+    assert backend.calls
+    expected_scope = common.encode_scope("umo-user", "user-2002")
+    assert jobs.gets == [(expected_scope, "job-1")]
+    assert ("sources.list_attachments", expected_scope) in sources.calls
+    assert event.stopped is False
+
+
+async def test_disabled_session_refuses_tools_without_service_calls(monkeypatch):
+    async def _disabled(umo: str, plugin_name: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        main_module.SessionPluginManager,
+        "is_plugin_enabled_for_session",
+        _disabled,
+    )
+    backend = FakeBackend()
+    sources = FakeSources()
+    jobs = FakeJobs()
+    plugin = make_plugin(backend=backend, sources=sources, jobs=jobs)
+    event = FakeEvent(admin=False, plugins_name=["astrbot_plugin_kb_manager"])
 
     for name in TOOL_NAMES:
         result = decode(await getattr(plugin, name)(event, **CALL_ARGS[name]))
         assert result["status"] == "failed", name
-        assert result["error"]["code"] == "permission_denied", name
-        assert result["job_id"] is None, name
+        assert result["error"]["code"] == "plugin_disabled", name
 
     assert backend.calls == []
     assert sources.calls == []
     assert sources.remembered == []
     assert jobs.submissions == []
     assert jobs.gets == []
-    assert event.stopped is False
+
+
+async def test_event_plugin_whitelist_excluding_this_plugin_refuses_tools():
+    plugin = make_plugin()
+    event = FakeEvent(plugins_name=["some_other_plugin"])
+
+    result = decode(await plugin.kbm_list_kbs(event))
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "plugin_disabled"
+
+
+async def test_session_lookup_failure_is_fail_closed(monkeypatch):
+    async def _boom(umo: str, plugin_name: str) -> bool:
+        raise RuntimeError("preferences unavailable")
+
+    monkeypatch.setattr(
+        main_module.SessionPluginManager,
+        "is_plugin_enabled_for_session",
+        _boom,
+    )
+    plugin = make_plugin()
+
+    result = decode(await plugin.kbm_list_kbs(FakeEvent()))
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "plugin_disabled"
+
+
+async def test_globally_disabled_tool_is_refused():
+    plugin = make_plugin()
+    disabled = llm_tools.get_func("kbm_delete_kb")
+    disabled.active = False
+    try:
+        result = decode(
+            await plugin.kbm_delete_kb(FakeEvent(), request_id="req-1", kb_id="kb-1")
+        )
+        assert result["status"] == "failed"
+        assert result["error"]["code"] == "tool_disabled"
+    finally:
+        disabled.active = True
 
 
 # ---------------------------------------------------------------------------
@@ -853,12 +945,36 @@ async def test_attachment_and_url_download_happen_inside_work():
 # ---------------------------------------------------------------------------
 
 
-async def test_message_listener_remembers_only_real_files_for_admins():
+def tool_names(request: ProviderRequest) -> set[str]:
+    if request.func_tool is None:
+        return set()
+    return {tool.name for tool in request.func_tool.tools}
+
+
+def _foreign_handler(*args: Any, **kwargs: Any) -> str:
+    return "external"
+
+
+def _foreign_tool(name: str = "foreign_tool") -> FunctionTool:
+    return FunctionTool(
+        name=name,
+        description="external tool",
+        parameters={
+            "type": "object",
+            "properties": {"x": {"type": "string", "description": "x"}},
+        },
+        handler=functools.partial(_foreign_handler),
+        handler_module_path="external.plugin.main",
+    )
+
+
+async def test_message_listener_remembers_real_files_for_enabled_senders():
     sources = FakeSources()
     plugin = make_plugin(sources=sources)
     file_component = File(name="report.txt", file="C:/tmp/report.txt")
     event = FakeEvent(
-        messages=[Plain("hello"), file_component, Image(file="C:/tmp/x.png")]
+        admin=False,
+        messages=[Plain("hello"), file_component, Image(file="C:/tmp/x.png")],
     )
 
     await plugin.kbm_on_message(event)
@@ -868,33 +984,200 @@ async def test_message_listener_remembers_only_real_files_for_admins():
     assert components == [file_component]
     assert event.stopped is False
 
-    non_admin = FakeEvent(admin=False, messages=[file_component])
-    await plugin.kbm_on_message(non_admin)
-    assert len(sources.remembered) == 1
 
-
-async def test_llm_request_hint_is_temporary_and_admin_only():
+async def test_llm_request_hint_is_temporary_for_every_enabled_sender():
     sources = FakeSources()
     sources.attachment_infos = [
         {"attachment_id": "att-1", "filename": "a.txt"},
         {"attachment_id": "att-2", "filename": "b.md"},
     ]
     plugin = make_plugin(sources=sources)
-    event = FakeEvent(umo="umo-hint", sender="sender-hint")
-    request = ProviderRequest(prompt="hello")
+
+    for admin in (True, False):
+        event = FakeEvent(
+            admin=admin, umo=f"umo-hint-{admin}", sender=f"sender-{admin}"
+        )
+        request = ProviderRequest(prompt="hello")
+        await plugin.kbm_on_llm_request(event, request)
+        assert len(request.extra_user_content_parts) == 1
+        part = request.extra_user_content_parts[0]
+        assert isinstance(part, TextPart)
+        assert part._no_save is True
+        assert "att-1" in part.text and "a.txt" in part.text
+        assert "att-2" in part.text and "b.md" in part.text
+        assert AUTONOMY_BLOCK_START in request.system_prompt
+
+
+async def test_plain_request_gets_autonomy_prompt_and_tools_without_attachments():
+    plugin = make_plugin(sources=FakeSources())
+    event = FakeEvent(admin=False)  # ordinary sender, no maintenance command
+    request = ProviderRequest(prompt="大家早上好")
 
     await plugin.kbm_on_llm_request(event, request)
-    assert len(request.extra_user_content_parts) == 1
-    part = request.extra_user_content_parts[0]
-    assert isinstance(part, TextPart)
-    assert part._no_save is True
-    assert "att-1" in part.text and "a.txt" in part.text
-    assert "att-2" in part.text and "b.md" in part.text
 
-    non_admin = FakeEvent(admin=False)
-    other_request = ProviderRequest(prompt="hello")
-    await plugin.kbm_on_llm_request(non_admin, other_request)
-    assert other_request.extra_user_content_parts == []
+    assert AUTONOMY_BLOCK_START in request.system_prompt
+    assert DEFAULT_AUTONOMY_PROMPT in request.system_prompt
+    assert request.extra_user_content_parts == []
+    assert tool_names(request) == set(TOOL_NAMES)
+
+    empty = ProviderRequest(prompt="hi")
+    empty.func_tool = ToolSet()
+    await plugin.kbm_on_llm_request(event, empty)
+    assert tool_names(empty) == set(TOOL_NAMES)
+
+
+async def test_llm_request_prompt_is_preserved_and_idempotent():
+    plugin = make_plugin()
+    event = FakeEvent()
+    request = ProviderRequest(prompt="hi", system_prompt="【人格】保持简洁。")
+
+    await plugin.kbm_on_llm_request(event, request)
+    first = request.system_prompt
+    assert first.startswith("【人格】保持简洁。")
+    assert first.count(AUTONOMY_BLOCK_START) == 1
+
+    await plugin.kbm_on_llm_request(event, request)
+    assert request.system_prompt == first
+    assert tool_names(request) == set(TOOL_NAMES)
+
+
+async def test_custom_autonomy_prompt_replaces_the_module_default():
+    plugin = make_plugin(config={"autonomy_system_prompt": "自定义维护规则"})
+    request = ProviderRequest(prompt="hi")
+
+    await plugin.kbm_on_llm_request(FakeEvent(), request)
+
+    assert "自定义维护规则" in request.system_prompt
+    assert DEFAULT_AUTONOMY_PROMPT not in request.system_prompt
+
+
+async def test_blank_autonomy_prompt_falls_back_to_default():
+    plugin = make_plugin(config={"autonomy_system_prompt": "   \n"})
+    request = ProviderRequest(prompt="hi")
+
+    await plugin.kbm_on_llm_request(FakeEvent(), request)
+
+    assert DEFAULT_AUTONOMY_PROMPT in request.system_prompt
+
+
+async def test_request_tool_set_is_merged_without_mutating_shared_state():
+    plugin = make_plugin()
+    bare = llm_tools.get_func("kbm_list_kbs")
+    assert bare is not None and bare.handler is not None
+    foreign = _foreign_tool()
+    shared = ToolSet()
+    shared.add_tool(bare)
+    shared.add_tool(foreign)
+    request = ProviderRequest(prompt="hi", func_tool=shared)
+
+    await plugin.kbm_on_llm_request(FakeEvent(), request)
+
+    assert request.func_tool is not shared
+    assert shared.tools == [bare, foreign]
+    merged = {tool.name: tool for tool in request.func_tool.tools}
+    assert set(merged) == set(TOOL_NAMES) | {"foreign_tool"}
+    assert merged["foreign_tool"] is foreign
+    wrapped = merged["kbm_list_kbs"]
+    assert wrapped is not bare
+    assert wrapped.handler is None
+    assert type(wrapped).__name__ == "_PermissionGuardedTool"
+    assert wrapped._wrapped is bare
+
+
+async def test_existing_external_same_name_tool_is_not_overridden():
+    plugin = make_plugin()
+    external = _foreign_tool("kbm_search")
+    request = ProviderRequest(prompt="hi")
+    request.func_tool = ToolSet()
+    request.func_tool.add_tool(external)
+
+    await plugin.kbm_on_llm_request(FakeEvent(), request)
+
+    merged = {tool.name: tool for tool in request.func_tool.tools}
+    assert merged["kbm_search"] is external
+    assert set(merged) == set(TOOL_NAMES)
+
+
+async def test_globally_disabled_tool_is_excluded_from_the_request():
+    plugin = make_plugin()
+    disabled = llm_tools.get_func("kbm_delete_kb")
+    disabled.active = False
+    try:
+        shared = ToolSet()
+        shared.add_tool(disabled)
+        request = ProviderRequest(prompt="hi", func_tool=shared)
+
+        await plugin.kbm_on_llm_request(FakeEvent(), request)
+
+        assert tool_names(request) == set(TOOL_NAMES) - {"kbm_delete_kb"}
+        assert shared.tools == [disabled]
+    finally:
+        disabled.active = True
+
+
+async def test_disabled_session_skips_injection_and_removes_own_tools(monkeypatch):
+    async def _disabled(umo: str, plugin_name: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        main_module.SessionPluginManager,
+        "is_plugin_enabled_for_session",
+        _disabled,
+    )
+    sources = FakeSources()
+    plugin = make_plugin(sources=sources)
+    bare = llm_tools.get_func("kbm_list_kbs")
+    foreign = _foreign_tool()
+    shared = ToolSet()
+    shared.add_tool(bare)
+    shared.add_tool(foreign)
+    request = ProviderRequest(prompt="hi", system_prompt="【人格】", func_tool=shared)
+    event = FakeEvent(admin=False)
+
+    await plugin.kbm_on_llm_request(event, request)
+
+    assert request.system_prompt == "【人格】"
+    assert shared.tools == [bare, foreign]
+    assert [tool.name for tool in request.func_tool.tools] == ["foreign_tool"]
+
+    empty_request = ProviderRequest(prompt="hi")
+    await plugin.kbm_on_llm_request(event, empty_request)
+    assert empty_request.system_prompt == ""
+    assert empty_request.func_tool is None
+
+    # The attachment listener is gated by the same session state.
+    file_component = File(name="a.txt", file="C:/tmp/a.txt")
+    await plugin.kbm_on_message(FakeEvent(messages=[file_component]))
+    assert sources.remembered == []
+
+
+async def test_plugin_whitelist_exclusion_disables_injection_and_tools():
+    plugin = make_plugin()
+    event = FakeEvent(plugins_name=["other_plugin"])
+    request = ProviderRequest(prompt="hi")
+
+    await plugin.kbm_on_llm_request(event, request)
+
+    assert request.system_prompt == ""
+    assert request.func_tool is None
+
+
+async def test_session_lookup_failure_blocks_injection_and_tools(monkeypatch):
+    async def _boom(umo: str, plugin_name: str) -> bool:
+        raise RuntimeError("preferences unavailable")
+
+    monkeypatch.setattr(
+        main_module.SessionPluginManager,
+        "is_plugin_enabled_for_session",
+        _boom,
+    )
+    plugin = make_plugin()
+    request = ProviderRequest(prompt="hi")
+
+    await plugin.kbm_on_llm_request(FakeEvent(), request)
+
+    assert request.system_prompt == ""
+    assert request.func_tool is None
 
 
 # ---------------------------------------------------------------------------
